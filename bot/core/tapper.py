@@ -1,8 +1,6 @@
 import asyncio
 from urllib.parse import unquote
-
 import aiohttp
-from aiocfscrape import CloudflareScraper
 from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
 from pyrogram import Client
@@ -10,6 +8,7 @@ from pyrogram.errors import Unauthorized, UserDeactivated, AuthKeyUnregistered, 
 from pyrogram.raw.functions.messages import RequestWebView
 
 from bot.config import settings
+from bot.data import Data
 from bot.utils import logger
 from bot.exceptions import InvalidSession
 from .headers import headers
@@ -20,67 +19,20 @@ import json
 
 
 class Tapper:
-    def __init__(self, tg_client: Client):
+    def __init__(self, tg_client: Data):
         self.session_name = tg_client.name
         self.tg_client = tg_client
         self.user_id = 0
 
-    async def get_tg_web_data(self, proxy: str | None) -> str:
-        if proxy:
-            proxy = Proxy.from_str(proxy)
-            proxy_dict = dict(
-                scheme=proxy.protocol,
-                hostname=proxy.host,
-                port=proxy.port,
-                username=proxy.login,
-                password=proxy.password
-            )
-        else:
-            proxy_dict = None
+   
 
-        self.tg_client.proxy = proxy_dict
-
-        try:
-            with_tg = True
-
-            if not self.tg_client.is_connected:
-                with_tg = False
-                try:
-                    await self.tg_client.connect()
-                except (Unauthorized, UserDeactivated, AuthKeyUnregistered):
-                    raise InvalidSession(self.session_name)
-
-            while True:
-                try:
-                    peer = await self.tg_client.resolve_peer('cexio_tap_bot')
-                    break
-                except FloodWait as fl:
-                    fls = fl.value
-
-                    logger.warning(f"{self.session_name} | FloodWait {fl}")
-                    logger.info(f"{self.session_name} | Sleep {fls}s")
-
-                    await asyncio.sleep(fls + 3)
-
-            web_view = await self.tg_client.invoke(RequestWebView(
-                peer=peer,
-                bot=peer,
-                platform='android',
-                from_bot_menu=False,
-                url='https://cexp.cex.io/'
-            ))
-
-            auth_url = web_view.url
-            tg_web_data = unquote(
-                string=unquote(
-                    string=auth_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0]))
-
-            self.user_id = (await self.tg_client.get_me()).id
-
-            if with_tg is False:
-                await self.tg_client.disconnect()
-
-            return tg_web_data
+    async def get_tg_web_data(self, session_name: str) -> str:
+        try:           
+            # Read JSON data from file
+            with open("json/"+session_name+".json", 'r', encoding="utf8") as file:
+                json_data = file.read()
+                self.user_id = json_data.split('user=%7B%22id%22%3A')[1].split("%2C%22first_name")[0]
+            return json_data
 
         except InvalidSession as error:
             raise error
@@ -95,7 +47,8 @@ class Tapper:
             results = []
             for task_id in task_list:
                 response = await http_client.post(url='https://cexp.cex.io/api/startTask',
-                                                  json={'authData': tg_web_data, 'devAuthData': self.user_id,
+                                                  json={'authData': tg_web_data, 
+                                                        'devAuthData': self.user_id,
                                                         'data': {'taskId': task_id}})
                 response_text = await response.text()
                 response.raise_for_status()
@@ -300,117 +253,118 @@ class Tapper:
         proxy_conn = ProxyConnector().from_url(proxy) if proxy else None
 
         headers['User-Agent'] = generate_random_user_agent(device_type='android', browser_type='chrome')
-        async with CloudflareScraper(headers=headers, connector=proxy_conn) as http_client:
-            if proxy:
-                await self.check_proxy(http_client=http_client, proxy=proxy)
+        http_client = aiohttp.ClientSession(headers=headers, connector=proxy_conn)
+        
+        if proxy:
+            await self.check_proxy(http_client=http_client, proxy=proxy)
 
-            tg_web_data = await self.get_tg_web_data(proxy=proxy)
+        tg_web_data = await self.get_tg_web_data(session_name=self.session_name)
 
-            while True:
-                try:
-                    prof_data = await self.profile_data(http_client=http_client, tg_web_data=tg_web_data)
-                    if prof_data:
-                        pass
+        while True:
+            try:
+                prof_data = await self.profile_data(http_client=http_client, tg_web_data=tg_web_data)
+                if prof_data:
+                    pass
 
-                    cooldown = int(prof_data['data']['currentTapWindowFinishAt'])
-                    available_taps = int(prof_data['data']['availableTaps'])
-                    farm_reward = int(float(prof_data['data']['farmReward']))
-                    data = await self.claim_ref(http_client=http_client, tg_web_data=tg_web_data, part=1)
+                cooldown = int(prof_data['data']['currentTapWindowFinishAt'])
+                available_taps = int(prof_data['data']['availableTaps'])
+                farm_reward = int(float(prof_data['data']['farmReward']))
+                data = await self.claim_ref(http_client=http_client, tg_web_data=tg_web_data, part=1)
+                none_tasks, ready_to_check_tasks = await self.getTasks(http_client=http_client,
+                                                                        tg_web_data=tg_web_data)
+
+                if settings.CLAIM_TASKS and (none_tasks or ready_to_check_tasks):
                     none_tasks, ready_to_check_tasks = await self.getTasks(http_client=http_client,
-                                                                           tg_web_data=tg_web_data)
-
-                    if settings.CLAIM_TASKS and (none_tasks or ready_to_check_tasks):
-                        none_tasks, ready_to_check_tasks = await self.getTasks(http_client=http_client,
-                                                                               tg_web_data=tg_web_data)
-
-                        statuses = None
-
-                        if none_tasks:
-                            statuses = await self.startTasks(http_client=http_client, task_list=none_tasks,
-                                                         tg_web_data=tg_web_data)
-
-                        if ready_to_check_tasks:
-                            only_check = True
-
-                        if (statuses is not None and all(statuses)) or only_check:
-                            logger.success(f'{self.session_name} | Waiting before claiming, 65 s')
-                            await asyncio.sleep(delay=65)
-                            none_tasks, ready_to_check_tasks = await self.getTasks(http_client=http_client,
-                                                                                   tg_web_data=tg_web_data)
-                            status = await self.checkTasks(http_client=http_client, task_list=ready_to_check_tasks,
-                                                           tg_web_data=tg_web_data)
-                            if all(status):
-                                status = await self.claimTasks(http_client=http_client, task_list=ready_to_check_tasks,
-                                                               tg_web_data=tg_web_data)
-                                if all(status):
-                                    logger.success(f'{self.session_name} | Claimed all tasks')
-
-                    if settings.CLAIM_SQUAD_REWARD and int(float(data['data']['totalRewardsToClaim'])) != 0:
-                        data = await self.claim_ref(http_client=http_client, tg_web_data=tg_web_data, part=2)
-                        if data['status'] == "ok":
-                            logger.success(f'{self.session_name} | Claimed referrals reward, amount: '
-                                        f'{data["data"]["claimedBalance"]}')
-
-                    if farm_reward == 0 and settings.FARM_MINING_ERA:
-                        status = await self.start_farm(http_client=http_client, tg_web_data=tg_web_data)
-                        if status is True:
-                            prof_data = await self.profile_data(http_client=http_client, tg_web_data=tg_web_data)
-                            farm_reward = int(float(prof_data['data']['farmReward']))
-                            logger.success(f'{self.session_name} | Start mining era, early reward: {farm_reward}')
-
-                    if farm_reward != 0 and settings.FARM_MINING_ERA:
-                        try:
-                            farm_reward = int(float(prof_data['data']['farmReward']))
-                            current_time = datetime.now()
-                            time_conv_rn = current_time.astimezone(timezone.utc)
-                            time_conv_rn = time_conv_rn.strftime("%Y-%m-%d %H:%M:%S")
-                            farm_start = prof_data['data']['farmStartedAt']
-                            convert = datetime.strptime(farm_start, "%Y-%m-%dT%H:%M:%S.%fZ")
-                            convert += timedelta(hours=4)
-                            if time_conv_rn > str(convert):
-                                status = await self.claim_farm(http_client=http_client, tg_web_data=tg_web_data)
-                                if status == "ok":
-                                    logger.success(f'{self.session_name} | Claimed mining era, got amount: '
-                                                   f'{farm_reward}')
-                                    status = await self.start_farm(http_client=http_client, tg_web_data=tg_web_data)
-                                    if status is True:
-                                        prof_data = await self.profile_data(http_client=http_client,
                                                                             tg_web_data=tg_web_data)
-                                        farm_reward = int(float(prof_data['data']['farmReward']))
-                                        logger.success(
-                                            f'{self.session_name} | Start mining era, early reward: {farm_reward}')
-                                else:
-                                    logger.info(f'{self.session_name} | {status}')
-                        except Exception as e:
-                            logger.error(e)
 
-                    if available_taps != 0 and settings.TAPS:
-                        rand_taps = randint(a=settings.TAPS_AMOUNT[0], b=settings.TAPS_AMOUNT[1])
-                        if available_taps < rand_taps:
-                            status = await self.claim_taps(http_client=http_client, taps=available_taps,
-                                                           tg_web_data=tg_web_data)
-                            if status is True:
-                                logger.success(f'{self.session_name} | Claimed taps, count: {available_taps}')
-                                await asyncio.sleep(delay=2)
-                        else:
-                            status = await self.claim_taps(http_client=http_client, taps=rand_taps,
-                                                       tg_web_data=tg_web_data)
-                            if status is True:
-                                logger.success(f'{self.session_name} | Claimed taps, count: {rand_taps}')
-                                await asyncio.sleep(delay=2)
-                    elif cooldown != 0 and available_taps == 0:
-                        logger.info(f'{self.session_name} | No taps, sleeping 1 hour')
-                        await asyncio.sleep(delay=3600)
+                    statuses = None
 
-                except InvalidSession as error:
-                    raise error
+                    if none_tasks:
+                        statuses = await self.startTasks(http_client=http_client, task_list=none_tasks,
+                                                        tg_web_data=tg_web_data)
 
-                except Exception as error:
-                    logger.error(f"{self.session_name} | Unknown error: {error}")
-                    await asyncio.sleep(delay=3)
+                    if ready_to_check_tasks:
+                        only_check = True
+
+                    if (statuses is not None and all(statuses)) or only_check:
+                        logger.success(f'{self.session_name} | Waiting before claiming, 65 s')
+                        await asyncio.sleep(delay=65)
+                        none_tasks, ready_to_check_tasks = await self.getTasks(http_client=http_client,
+                                                                                tg_web_data=tg_web_data)
+                        status = await self.checkTasks(http_client=http_client, task_list=ready_to_check_tasks,
+                                                        tg_web_data=tg_web_data)
+                        if all(status):
+                            status = await self.claimTasks(http_client=http_client, task_list=ready_to_check_tasks,
+                                                            tg_web_data=tg_web_data)
+                            if all(status):
+                                logger.success(f'{self.session_name} | Claimed all tasks')
+
+                if settings.CLAIM_SQUAD_REWARD and int(float(data['data']['totalRewardsToClaim'])) != 0:
+                    data = await self.claim_ref(http_client=http_client, tg_web_data=tg_web_data, part=2)
+                    if data['status'] == "ok":
+                        logger.success(f'{self.session_name} | Claimed referrals reward, amount: '
+                                    f'{data["data"]["claimedBalance"]}')
+
+                if farm_reward == 0 and settings.FARM_MINING_ERA:
+                    status = await self.start_farm(http_client=http_client, tg_web_data=tg_web_data)
+                    if status is True:
+                        prof_data = await self.profile_data(http_client=http_client, tg_web_data=tg_web_data)
+                        farm_reward = int(float(prof_data['data']['farmReward']))
+                        logger.success(f'{self.session_name} | Start mining era, early reward: {farm_reward}')
+
+                if farm_reward != 0 and settings.FARM_MINING_ERA:
+                    try:
+                        farm_reward = int(float(prof_data['data']['farmReward']))
+                        current_time = datetime.now()
+                        time_conv_rn = current_time.astimezone(timezone.utc)
+                        time_conv_rn = time_conv_rn.strftime("%Y-%m-%d %H:%M:%S")
+                        farm_start = prof_data['data']['farmStartedAt']
+                        convert = datetime.strptime(farm_start, "%Y-%m-%dT%H:%M:%S.%fZ")
+                        convert += timedelta(hours=4)
+                        if time_conv_rn > str(convert):
+                            status = await self.claim_farm(http_client=http_client, tg_web_data=tg_web_data)
+                            if status == "ok":
+                                logger.success(f'{self.session_name} | Claimed mining era, got amount: '
+                                                f'{farm_reward}')
+                                status = await self.start_farm(http_client=http_client, tg_web_data=tg_web_data)
+                                if status is True:
+                                    prof_data = await self.profile_data(http_client=http_client,
+                                                                        tg_web_data=tg_web_data)
+                                    farm_reward = int(float(prof_data['data']['farmReward']))
+                                    logger.success(
+                                        f'{self.session_name} | Start mining era, early reward: {farm_reward}')
+                            else:
+                                logger.info(f'{self.session_name} | {status}')
+                    except Exception as e:
+                        logger.error(e)
+
+                if available_taps != 0 and settings.TAPS:
+                    rand_taps = randint(a=settings.TAPS_AMOUNT[0], b=settings.TAPS_AMOUNT[1])
+                    if available_taps < rand_taps:
+                        status = await self.claim_taps(http_client=http_client, taps=available_taps,
+                                                        tg_web_data=tg_web_data)
+                        if status is True:
+                            logger.success(f'{self.session_name} | Claimed taps, count: {available_taps}')
+                            await asyncio.sleep(delay=2)
+                    else:
+                        status = await self.claim_taps(http_client=http_client, taps=rand_taps,
+                                                    tg_web_data=tg_web_data)
+                        if status is True:
+                            logger.success(f'{self.session_name} | Claimed taps, count: {rand_taps}')
+                            await asyncio.sleep(delay=2)
+                elif cooldown != 0 and available_taps == 0:
+                    logger.info(f'{self.session_name} | No taps, sleeping 1 hour')
+                    await asyncio.sleep(delay=3600)
+
+            except InvalidSession as error:
+                raise error
+
+            except Exception as error:
+                logger.error(f"{self.session_name} | Unknown error: {error}")
+                await asyncio.sleep(delay=3)
 
 
-async def run_tapper(tg_client: Client, proxy: str | None):
+async def run_tapper(tg_client: Data, proxy: str | None):
     try:
         await Tapper(tg_client=tg_client).run(proxy=proxy)
     except InvalidSession:

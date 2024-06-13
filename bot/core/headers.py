@@ -1,6 +1,6 @@
 headers = {
     'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
+    'Accept-Language': 'en-US,en;q=0.5',
     'Connection': 'keep-alive',
     'Content-Type': 'application/json',
     'Host': 'cexp.cex.io',
